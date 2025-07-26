@@ -4,6 +4,7 @@ import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
 import time
+import re # Para expressões regulares, mais robusto para números
 
 # Configurações da página (certifique-se de ter removido o 'icon="📈"')
 st.set_page_config(page_title="Indicadores B3 em Tempo Real", layout="wide")
@@ -37,7 +38,7 @@ tickers_list = [t.strip().upper() for t in tickers_input.split('\n') if t.strip(
 
 # Dicionário de mapeamento de colunas do Status Invest para nomes amigáveis
 MAP_STATUS_INVEST_COLS = {
-    'P/L': 'P/L', 'P/VP': 'P/VP', 'PSR': 'PSR', 'Div.Yield': 'DY', # Mantenha DY aqui
+    'P/L': 'P/L', 'P/VP': 'P/VP', 'PSR': 'PSR', 'Div.Yield': 'DY',
     'P/Ativo': 'P/Ativos', 'P/Cap.Giro': 'P/Cap. Giro', 'P/EBIT': 'P/EBIT',
     'P/Ativ Circ.Liq.': 'P. At Cir. Liq.', 'EV/EBIT': 'EV/EBIT',
     'Div.Líq./PL': 'Div. Liq. / Patri', 'Div.Líq./EBIT': 'Divida Liquida / EBIT',
@@ -47,8 +48,37 @@ MAP_STATUS_INVEST_COLS = {
     'M. EBIT': 'Margem EBIT', 'M. Líquida': 'Marg. Liquida',
     'VPA': 'VPA', 'LPA': 'LPA', 'CAGR Rec. 5 Anos': 'CAGR Receitas 5 Anos',
     'CAGR Lucros 5 Anos': 'CAGR Lucros 5 Anos', 'Liq. Média Diária': 'Liquidez Media Diaria',
-    'Valor de Mercado': 'VALOR_DE_MERCADO', # Adicionado, pois Status Invest tem este
+    'Valor de Mercado': 'VALOR_DE_MERCADO',
 }
+
+# Função auxiliar para limpar e converter strings numéricas
+def clean_and_convert_value(value_str):
+    if not isinstance(value_str, str):
+        return None
+
+    # Remove qualquer coisa que não seja dígito, vírgula, ponto, ou sinal de menos
+    clean_str = re.sub(r'[^\d,\.-]', '', value_str).strip()
+
+    if not clean_str:
+        return None
+
+    # Verifica se o número usa vírgula como separador decimal
+    if ',' in clean_str and '.' in clean_str:
+        # Se tem ambos, e o ponto vem antes da vírgula, é separador de milhar.
+        # Ex: 1.234,56 -> remover o ponto, substituir vírgula por ponto.
+        if clean_str.rfind(',') > clean_str.rfind('.'):
+            clean_str = clean_str.replace('.', '').replace(',', '.')
+        # Ex: 1,234.56 (padrão gringo com vírgula de milhar) -> remover vírgula
+        else:
+            clean_str = clean_str.replace(',', '')
+    elif ',' in clean_str: # Apenas vírgula, então é separador decimal
+        clean_str = clean_str.replace(',', '.')
+
+    # Tenta converter para float
+    try:
+        return float(clean_str)
+    except ValueError:
+        return None # Retorna None se a conversão falhar
 
 # Função para buscar dados do Status Invest
 @st.cache_data(ttl=3600) # Cache os resultados por 1 hora para evitar muitas requisições
@@ -68,11 +98,11 @@ def fetch_status_invest_data(ticker_b3):
         # Preço Atual (Prioridade Status Invest para este)
         price_element = soup.find('div', title='Valor atual do ativo')
         if price_element:
-            price_text = price_element.find('strong').text.replace('.', '').replace(',', '.')
-            try:
-                data['PRECO'] = float(price_text)
-            except ValueError:
-                data['PRECO'] = None # Se não conseguir converter, deixa como None
+            price_text = price_element.find('strong').text.strip()
+            data['PRECO'] = clean_and_convert_value(price_text)
+        else:
+            data['PRECO'] = None
+            print(f"DEBUG: Preço não encontrado para {ticker_b3}")
 
         # Tentar pegar os indicadores da tabela principal
         indicators_box = soup.find('div', class_='box-indicators')
@@ -85,35 +115,33 @@ def fetch_status_invest_data(ticker_b3):
                     label = label_element.text.strip()
                     value_str = value_element.text.strip()
 
-                    # Limpeza e conversão do valor
-                    try:
-                        # Remover separadores de milhar (pontos), substituir vírgula por ponto decimal
-                        clean_value_str = value_str.replace('.', '').replace(',', '.')
+                    converted_value = clean_and_convert_value(value_str)
 
-                        # Verificar se é um percentual e ajustar a conversão
-                        if '%' in clean_value_str:
-                            value = float(clean_value_str.replace('%', '')) / 100
-                        elif 'M' in clean_value_str: # Milhões
-                            value = float(clean_value_str.replace('M', '')) * 1_000_000
-                        elif 'B' in clean_value_str: # Bilhões
-                            value = float(clean_value_str.replace('B', '')) * 1_000_000_000
-                        else:
-                            value = float(clean_value_str)
+                    # Ajuste para percentuais (DY, Margens, ROE, etc.)
+                    # Se o valor original tinha '%' e foi convertido, e o label é um dos percentuais
+                    if '%' in value_str and converted_value is not None:
+                         # O valor já foi limpo e convertido para float.
+                         # Se ele for um percentual (ex: 7.23), precisamos dividir por 100
+                         # Apenas se ele não for um valor já decimal (ex: 0.0723)
+                         if converted_value > 1.0 and label in ['Div.Yield', 'M. Bruta', 'M. EBIT', 'M. Líquida', 'ROE', 'ROA', 'ROIC']:
+                             converted_value /= 100.0
 
-                        mapped_label = MAP_STATUS_INVEST_COLS.get(label, label)
-                        data[mapped_label] = value
-                    except ValueError:
-                        data[label] = value_str # Manter como string se não puder converter
-                    except Exception as e:
-                        st.warning(f"Erro ao converter valor '{value_str}' para o indicador '{label}': {e}")
-                        data[label] = value_str # Manter como string ou None
+                    mapped_label = MAP_STATUS_INVEST_COLS.get(label, label)
+                    data[mapped_label] = converted_value
+                    # print(f"DEBUG: {ticker_b3} - {label} (raw: '{value_str}') -> {mapped_label}: {converted_value}")
+                else:
+                    print(f"DEBUG: Label ou valor não encontrado em um item para {ticker_b3}")
+        else:
+            print(f"DEBUG: 'box-indicators' não encontrado para {ticker_b3}")
 
         return data
     except requests.exceptions.RequestException as e:
         st.warning(f"Não foi possível buscar dados do Status Invest para {ticker_b3}. Erro de Requisição: {e}")
+        print(f"DEBUG: Erro de requisição para {ticker_b3}: {e}")
         return {'Ticker': ticker_b3}
     except Exception as e:
         st.warning(f"Erro inesperado ao processar dados do Status Invest para {ticker_b3}. Erro: {e}")
+        print(f"DEBUG: Erro geral ao processar {ticker_b3}: {e}")
         return {'Ticker': ticker_b3}
     finally:
         time.sleep(1) # Pequeno atraso para não sobrecarregar o servidor
@@ -128,7 +156,6 @@ def fetch_yfinance_data(ticker_yf):
 
         data = {
             'Ticker': ticker_yf,
-            # 'PRECO': info.get('currentPrice'), # Priorizaremos do Status Invest
             'DY_YF': info.get('dividendYield'), # Manter um DY do YF para comparação, se necessário
             'P/L_YF': info.get('forwardPE') or info.get('trailingPE'),
             'P/VP_YF': info.get('priceToBook'),
@@ -143,6 +170,7 @@ def fetch_yfinance_data(ticker_yf):
         return data
     except Exception as e:
         st.warning(f"Não foi possível buscar dados do Yahoo Finance para {ticker_yf}. Erro: {e}")
+        print(f"DEBUG: Erro YFinance para {ticker_yf}: {e}")
         return {'Ticker': ticker_yf}
 
 # Função principal para buscar e combinar dados
@@ -155,13 +183,28 @@ def get_combined_data(tickers):
         status_text.text(f"Buscando dados para {ticker} ({i+1}/{len(tickers)})...")
         progress_bar.progress((i + 1) / len(tickers))
 
-        # Dados do Status Invest (prioridade para fundamentalistas)
-        si_data = fetch_status_invest_data(ticker)
-        # Dados do Yahoo Finance (complementar)
         yf_data = fetch_yfinance_data(ticker)
+        si_data = fetch_status_invest_data(ticker)
 
-        # Combinar os dicionários. si_data vai sobrescrever yf_data para chaves em comum.
-        combined_row = {**yf_data, **si_data}
+        # Inicia com os dados do yfinance (mais confiável para o que tem)
+        combined_row = yf_data.copy()
+
+        # Sobrescreve/adiciona dados do Status Invest se existirem e forem válidos
+        for key, value in si_data.items():
+            # Se o Status Invest tem um valor e não é apenas o Ticker, ou se o yfinance não tem
+            # para aquela chave específica (ex: P/L), ou se o Status Invest tem um valor
+            # que não é None, então priorizamos o Status Invest.
+            # PRECO do Status Invest tem prioridade total.
+            if key == 'PRECO':
+                if value is not None:
+                    combined_row[key] = value
+                elif 'currentPrice' in yf_data and yf_data['currentPrice'] is not None: # fallback para yfinance se Status Invest falhar
+                     combined_row[key] = yf_data['currentPrice']
+            elif value is not None and key != 'Ticker': # Não sobrescreve Ticker nem se for None
+                combined_row[key] = value
+            elif key not in combined_row and value is not None: # Adiciona se não existe e é válido
+                combined_row[key] = value
+
         all_data.append(combined_row)
 
     progress_bar.empty()
@@ -173,8 +216,7 @@ if st.button("Buscar Dados em Tempo Real"):
         with st.spinner("Buscando dados, por favor aguarde..."):
             df_final = get_combined_data(tickers_list)
 
-            # Reordenar as colunas e garantir que todas as colunas desejadas existam
-            # Assegura que colunas do Status Invest (sem _SI) têm prioridade.
+            # Define a ordem desejada das colunas
             desired_columns_order = [
                 'Ticker', 'PRECO', 'DY', 'P/L', 'P/VP', 'P/Ativos', 'Margem Bruta',
                 'Margem EBIT', 'Marg. Liquida', 'P/EBIT', 'EV/EBIT',
@@ -200,15 +242,15 @@ if st.button("Buscar Dados em Tempo Real"):
                 if col in ['DY', 'Margem Bruta', 'Margem EBIT', 'Marg. Liquida', 'ROE', 'ROA', 'ROIC',
                             'Patrimonio / Ativos', 'Passivos / Ativos', 'Giro Ativos',
                             'CAGR Receitas 5 Anos', 'CAGR Lucros 5 Anos']:
-                    # Estes valores já devem ter vindo como decimal (ex: 0.0723 para 7.23%)
                     df_final[col] = df_final[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "N/D")
-                elif col in ['PRECO', 'Liquidez Media Diaria', 'VALOR_DE_MERCADO']:
+                elif col in ['PRECO']: # Apenas preço para moeda
                     df_final[col] = df_final[col].apply(lambda x: f"R$ {x:,.2f}" if pd.notna(x) else "N/D")
+                elif col in ['Liquidez Media Diaria', 'VALOR_DE_MERCADO']: # Outros valores monetários maiores
+                     df_final[col] = df_final[col].apply(lambda x: f"R$ {x:,.0f}" if pd.notna(x) else "N/D") # Sem decimais para grandes valores
                 elif col in ['P/L', 'P/VP', 'P/Ativos', 'PSR', 'P/EBIT', 'EV/EBIT',
                              'Divida Liquida / EBIT', 'Div. Liq. / Patri', 'P/Cap. Giro',
                              'P. At Cir. Liq.', 'Liq. Corrente', 'VPA', 'LPA', 'PEG Ratio']:
                     df_final[col] = df_final[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "N/D")
-
 
             st.success("Busca de dados concluída!")
             st.dataframe(df_final, use_container_width=True, height=700) # Tabela ajusta à largura e tem altura fixa

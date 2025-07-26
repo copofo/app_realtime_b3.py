@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 import time # Para adicionar um pequeno delay entre as requisições, evitando bloqueios
 
 # Configurações da página
-st.set_page_config(page_title="Indicadores B3 em Tempo Real", layout="wide", icon="📈")
+st.set_page_config(page_title="Indicadores B3 em Tempo Real", layout="wide")
 st.title("📊 Indicadores Fundamentalistas da B3 (Tempo Real)")
 st.markdown("""
 Esta aplicação busca dados fundamentalistas e de cotação de ações da B3 em tempo real.
